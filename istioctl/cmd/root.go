@@ -264,6 +264,10 @@ debug and diagnose their Istio mesh.
 	hideInheritedFlags(installCmd, "namespace", "istioNamespace", "charts")
 	rootCmd.AddCommand(installCmd)
 
+	canaryApplyCmd := mesh.CanaryApplyCmd(loggingOptions)
+	hideInheritedFlags(canaryApplyCmd, "namespace", "istioNamespace", "charts")
+	rootCmd.AddCommand(canaryApplyCmd)
+
 	profileCmd := mesh.ProfileCmd()
 	hideInheritedFlags(profileCmd, "namespace", "istioNamespace", "charts")
 	rootCmd.AddCommand(profileCmd)
