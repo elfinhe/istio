@@ -271,20 +271,6 @@ func CanaryApplyManifests(inFilenames []string, force bool, dryRun bool, namespa
 								},
 							},
 						},
-						Tls: []*networking.TLSRoute{
-							{
-								Route: []*networking.RouteDestination{
-									{
-										Weight:      100 - canaryWeight,
-										Destination: &networking.Destination{Host: svc.Name},
-									},
-									{
-										Weight:      canaryWeight,
-										Destination: &networking.Destination{Host: canarySvc.Name},
-									},
-								},
-							},
-						},
 					},
 				}
 				err = applyIstioVirtualService(ic, vs, l)
