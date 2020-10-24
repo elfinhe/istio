@@ -20,7 +20,10 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
@@ -45,7 +48,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type canaryApplyArgs struct {
+type applyArgs struct {
+	// strategy describes the deployment strategy used for deployment
+	strategy deploymentStrategy
 	// namespace is the namespace to apply manifests
 	namespace string
 	// inFilenames is an array of paths to the input IstioOperator CR files.
@@ -64,44 +69,70 @@ type canaryApplyArgs struct {
 	force bool
 }
 
-func addCanaryApplyFlags(cmd *cobra.Command, args *canaryApplyArgs) {
+type DeployStrategyType string
+
+const (
+	Canary DeployStrategyType = "canary"
+	Shadow                    = "shadow"
+)
+
+var (
+	newObjList     unstructured.UnstructuredList
+	newVsList      istiocn.VirtualServiceList
+	fileExtensions = []string{".json", ".yaml", ".yml"}
+	dryRunStr      = " (dry run)"
+)
+
+type deploymentStrategy struct {
+	endWeight       int32
+	stepWeight      int32
+	intervalSeconds int
+	bakingSeconds   int
+	deployStrategy  DeployStrategyType
+	dryRun          bool
+}
+
+func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
 	cmd.PersistentFlags().StringVarP(&args.namespace, "namespace", "n", "", "The namespace that the manifests will be applied to")
 	cmd.PersistentFlags().StringSliceVarP(&args.inFilenames, "filename", "f", nil, filenameFlagHelpStr)
 	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", KubeConfigFlagHelpStr)
 	cmd.PersistentFlags().StringVar(&args.context, "context", "", ContextFlagHelpStr)
-	cmd.PersistentFlags().DurationVar(&args.readinessTimeout, "readiness-timeout", 300*time.Second,
-		"Maximum time to wait for Istio resources in each component to be ready.")
 	cmd.PersistentFlags().BoolVarP(&args.skipConfirmation, "skip-confirmation", "y", false, skipConfirmationFlagHelpStr)
-	cmd.PersistentFlags().BoolVar(&args.force, "force", false, ForceFlagHelpStr)
+	cmd.PersistentFlags().Int32Var(&args.strategy.endWeight, "end-weight", 30, "")
+	cmd.PersistentFlags().Int32Var(&args.strategy.stepWeight, "step-weight", 6, "")
+	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 5, "")
+	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 600, "")
+	cmd.PersistentFlags().StringVar((*string)(&args.strategy.deployStrategy), "deploy-strategy", Shadow, ContextFlagHelpStr)
 }
 
-// CanaryApplyCmd generates an Istio canaryApply manifest and applies it to a cluster
-func CanaryApplyCmd(logOpts *log.Options) *cobra.Command {
+// StrategicApplyCmd generates shadow/canary deployments and applies it to a cluster
+func StrategicApplyCmd(logOpts *log.Options) *cobra.Command {
 	rootArgs := &rootArgs{}
-	iArgs := &canaryApplyArgs{}
+	iArgs := &applyArgs{}
 
 	ic := &cobra.Command{
-		Use:   "canary-apply",
-		Short: "Similar to kubectl apply, but will run canary tests before applying deployments",
+		Use:   "strategic-apply",
+		Short: "Apply shadow/canary analysis for deployments, and cleanup resources after the analysis",
 		Args:  cobra.ExactArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCanaryApplyCmd(cmd, rootArgs, iArgs, logOpts)
+			return runStrategicApplyCmd(cmd, rootArgs, iArgs, logOpts)
 		}}
 
 	addFlags(ic, rootArgs)
-	addCanaryApplyFlags(ic, iArgs)
+	addApplyFlags(ic, iArgs)
 	return ic
 }
 
-func runCanaryApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *canaryApplyArgs, logOpts *log.Options) error {
+func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyArgs, logOpts *log.Options) error {
 	l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
-	// Warn users if they use `istioctl canary-apply` without any config args.
+	// Warn users if no arg
 	if !rootArgs.dryRun && !iArgs.skipConfirmation {
-		if !confirm("This will canary-apply manifests into the cluster. Proceed? (y/N)", cmd.OutOrStdout()) {
+		if !confirm("This will strategic-apply manifests into the cluster. Proceed? (y/N)", cmd.OutOrStdout()) {
 			cmd.Print("Cancelled.\n")
 			os.Exit(1)
 		}
 	}
+
 	if err := configLogs(logOpts); err != nil {
 		return fmt.Errorf("could not configure logs: %s", err)
 	}
@@ -109,24 +140,72 @@ func runCanaryApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *canaryAppl
 		// TODO: use the local kubeconfig's current namespace
 		iArgs.namespace = "default"
 	}
-	if err := CanaryApplyManifests(iArgs.inFilenames, iArgs.force, rootArgs.dryRun, iArgs.namespace,
-		iArgs.kubeConfigPath, iArgs.context, iArgs.readinessTimeout, l); err != nil {
-		return fmt.Errorf("failed to canary-apply manifests: %v", err)
+	ds := &deploymentStrategy{
+		endWeight:       iArgs.strategy.endWeight,
+		stepWeight:      iArgs.strategy.stepWeight,
+		intervalSeconds: iArgs.strategy.intervalSeconds,
+		bakingSeconds:   iArgs.strategy.bakingSeconds,
+		deployStrategy:  iArgs.strategy.deployStrategy,
+		dryRun:          rootArgs.dryRun,
+	}
+	if err := StrategicApplyManifests(ds, iArgs.inFilenames, iArgs.namespace, iArgs.kubeConfigPath, iArgs.context, l); err != nil {
+		return fmt.Errorf("failed to strategic-apply manifests: %v", err)
 	}
 
 	return nil
 }
 
-// CanaryApplyManifests generates manifests from the given input files and --set flag
+// StrategicApplyManifests generates manifests from the given input files and --set flag
 // overlays and applies them to the cluster
-//  force   validation warnings are written to logger but command is not aborted
 //  dryRun  all operations are done but nothing is written
-func CanaryApplyManifests(inFilenames []string, force bool, dryRun bool, namespace,
-	kubeConfigPath string, ctx string, waitTimeout time.Duration, l clog.Logger) error {
+func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, namespace, kubeConfigPath string, ctx string, l clog.Logger) error {
 	restConfig, _, clientObj, err := K8sConfig(kubeConfigPath, ctx)
 	ic, err := istioc.NewForConfig(restConfig)
 	if err != nil {
 		return err
+	}
+
+	// Register cleanup process for interrupt and terminate signals
+	signals := make(chan os.Signal)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		if err := cleanup(ic, clientObj, ds.dryRun, l); err != nil {
+			l.LogAndPrint("Clean up failed: %s", err)
+		}
+		os.Exit(1)
+	}()
+
+	var filenames []string
+	for _, path := range inFilenames {
+		if path == "-" {
+			filenames = append(filenames, path)
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		if info.IsDir() {
+			err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.IsDir() {
+					return nil
+				}
+				if !isValidFile(path) {
+					l.LogAndPrintf("Skipping file %v, recognized file extensions are: %v\n", path, fileExtensions)
+					return nil
+				}
+				filenames = append(filenames, path)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		} else {
+			filenames = append(filenames, path)
+		}
 	}
 
 	ym, err := readYAMLs(inFilenames, os.Stdin)
@@ -134,7 +213,6 @@ func CanaryApplyManifests(inFilenames []string, force bool, dryRun bool, namespa
 		return err
 	}
 
-	l.LogAndPrintf("Read manifests from:\n%v", inFilenames)
 	allObjects, err := object.ParseK8sObjectsFromYAMLManifest(ym)
 	if err != nil {
 		return err
@@ -151,37 +229,36 @@ func CanaryApplyManifests(inFilenames []string, force bool, dryRun bool, namespa
 	l.LogAndPrint("\nApply non-deployment objects:")
 	for _, obj := range nonDeployObjs.UnstructuredItems() {
 		obj.SetNamespace(namespace)
-		if err := applyObj(obj, clientObj, l); err != nil {
+		if err := applyObj(obj, clientObj, ds.dryRun, l); err != nil {
 			return err
 		}
 	}
 
-	l.LogAndPrint("\nApply deployments with canary:")
-	canaryObjList := &unstructured.UnstructuredList{}
-	canaryVsList := &istiocn.VirtualServiceList{}
+	l.LogAndPrintf("\nApply deployments with %s:", ds.deployStrategy)
 	for _, deploy := range deployObjs.UnstructuredItems() {
-		canaryDeploy := &appsv1.Deployment{}
-		runtime.DefaultUnstructuredConverter.FromUnstructured(deploy.Object, &canaryDeploy)
-		canaryDeploy.SetNamespace(namespace)
-		deployTplLabels := canaryDeploy.Spec.Template.Labels
-		canaryLabels := map[string]string{"canary.istio.io/deployment": canaryDeploy.GetName()}
-		canaryDeploy.SetLabels(canaryLabels)
-		canaryDeploy.Spec.Template.Labels = canaryLabels
-		canaryDeploy.SetName(canaryDeploy.GetName() + "-canary")
-		canaryDeployUnstructed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(canaryDeploy)
+		newDeploy := &appsv1.Deployment{}
+		if err = runtime.DefaultUnstructuredConverter.FromUnstructured(deploy.Object, &newDeploy); err != nil {
+			return err
+		}
+		newDeploy.SetNamespace(namespace)
+		deployTplLabels := newDeploy.Spec.Template.Labels
+		newLabels := map[string]string{"istio.io/deployment": newDeploy.GetName()}
+		newDeploy.SetLabels(newLabels)
+		newDeploy.Spec.Template.Labels = newLabels
+		newDeploy.SetName(newDeploy.GetName() + "-" + string(ds.deployStrategy))
+		newDeployUnstructed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newDeploy)
 		if err != nil {
 			return err
 		}
 
-		labelSelector := &metav1.LabelSelector{MatchLabels: canaryLabels}
-		if err := tpath.WriteNode(canaryDeployUnstructed, util.ToYAMLPath("spec.selector"), labelSelector); err != nil {
+		labelSelector := &metav1.LabelSelector{MatchLabels: newLabels}
+		if err := tpath.WriteNode(newDeployUnstructed, util.ToYAMLPath("spec.selector"), labelSelector); err != nil {
 			return err
 		}
 
-		// Apply canary deployment
-		canaryObj := unstructured.Unstructured{Object: canaryDeployUnstructed}
-		canaryObjList.Items = append(canaryObjList.Items, canaryObj)
-		if err := applyObj(canaryObj, clientObj, l); err != nil {
+		newObj := unstructured.Unstructured{Object: newDeployUnstructed}
+		newObjList.Items = append(newObjList.Items, newObj)
+		if err := applyObj(newObj, clientObj, ds.dryRun, l); err != nil {
 			return err
 		}
 
@@ -202,129 +279,176 @@ func CanaryApplyManifests(inFilenames []string, force bool, dryRun bool, namespa
 
 		// For each service
 		for _, svc := range svcListForDeploy.Items {
-			// Create canary service
-			canarySvc := svc.DeepCopy()
-			canarySvc.Spec.Selector = canaryLabels
-			canarySvc.TypeMeta.SetGroupVersionKind(schema.GroupVersionKind{
+			newSvc := svc.DeepCopy()
+			newSvc.Spec.Selector = newLabels
+			newSvc.TypeMeta.SetGroupVersionKind(schema.GroupVersionKind{
 				Kind:    "Service",
 				Group:   "",
 				Version: "v1",
 			})
-			canarySvc.Status.Reset()
-			canarySvc.ObjectMeta.SetSelfLink("")
-			canarySvc.ObjectMeta.SetUID("")
-			canarySvc.ObjectMeta.SetResourceVersion("")
-			canarySvc.Spec.ClusterIP = ""
-			canarySvc.SetName(canarySvc.GetName() + "-canary")
-			canarySvcUnstructed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(canarySvc)
+			newSvc.Status.Reset()
+			newSvc.ObjectMeta.SetSelfLink("")
+			newSvc.ObjectMeta.SetUID("")
+			newSvc.ObjectMeta.SetResourceVersion("")
+			newSvc.Spec.ClusterIP = ""
+			newSvc.SetName(newSvc.GetName() + "-" + string(ds.deployStrategy))
+			newSvcUnstructed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newSvc)
 			if err != nil {
 				return err
 			}
-			canaryObj := unstructured.Unstructured{Object: canarySvcUnstructed}
-			canaryObjList.Items = append(canaryObjList.Items, canaryObj)
-			if err := applyObj(canaryObj, clientObj, l); err != nil {
+			newObj := unstructured.Unstructured{Object: newSvcUnstructed}
+			newObjList.Items = append(newObjList.Items, newObj)
+			if err := applyObj(newObj, clientObj, ds.dryRun, l); err != nil {
 				return err
 			}
 
-			// Parameters
-			startWeight := int32(0)
-			endWeight := int32(30)
-			stepWeight := int32(1)
-			intervalSeconds := 1
-			bakingSeconds := 600
-
-			vs := istiocn.VirtualService{}
-			for canaryWeight := startWeight; canaryWeight <= endWeight; canaryWeight += stepWeight {
-				l.LogAndPrintf("Shift canary traffic weight to %v", canaryWeight)
-				vs = istiocn.VirtualService{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      svc.Name + "-canary",
-						Namespace: svc.Namespace,
-					},
-					Spec: networking.VirtualService{
-						Hosts: []string{svc.Name},
-						Tcp: []*networking.TCPRoute{
-							{
-								Route: []*networking.RouteDestination{
-									{
-										Weight:      100 - canaryWeight,
-										Destination: &networking.Destination{Host: svc.Name},
+			l.LogAndPrintf("Start shifting/mirroring traffic to %s", newSvc.GetName())
+			var vs istiocn.VirtualService
+			vsCreated := false
+			for currentWeight := int32(0); currentWeight <= ds.endWeight; currentWeight += ds.stepWeight {
+				l.LogAndPrintf("Shift traffic weight to %v", currentWeight)
+				switch {
+				case ds.deployStrategy == Shadow:
+					vs = istiocn.VirtualService{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      svc.Name + "-" + string(ds.deployStrategy),
+							Namespace: svc.Namespace,
+						},
+						Spec: networking.VirtualService{
+							Hosts: []string{svc.Name},
+							Http: []*networking.HTTPRoute{
+								{
+									Route: []*networking.HTTPRouteDestination{
+										{
+											Weight:      100,
+											Destination: &networking.Destination{Host: svc.Name},
+										},
 									},
-									{
-										Weight:      canaryWeight,
-										Destination: &networking.Destination{Host: canarySvc.Name},
+									Mirror: &networking.Destination{Host: newSvc.Name},
+									MirrorPercentage: &networking.Percent{Value: float64(currentWeight)},
+								},
+							},
+						},
+					}
+				case ds.deployStrategy == Canary:
+					vs = istiocn.VirtualService{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      svc.Name + "-" + string(ds.deployStrategy),
+							Namespace: svc.Namespace,
+						},
+						Spec: networking.VirtualService{
+							Hosts: []string{svc.Name},
+							Tcp: []*networking.TCPRoute{
+								{
+									Route: []*networking.RouteDestination{
+										{
+											Weight:      100 - currentWeight,
+											Destination: &networking.Destination{Host: svc.Name},
+										},
+										{
+											Weight:      currentWeight,
+											Destination: &networking.Destination{Host: newSvc.Name},
+										},
+									},
+								},
+							},
+							Http: []*networking.HTTPRoute{
+								{
+									Route: []*networking.HTTPRouteDestination{
+										{
+											Weight:      100 - currentWeight,
+											Destination: &networking.Destination{Host: svc.Name},
+										},
+										{
+											Weight:      currentWeight,
+											Destination: &networking.Destination{Host: newSvc.Name},
+										},
 									},
 								},
 							},
 						},
-						Http: []*networking.HTTPRoute{
-							{
-								Route: []*networking.HTTPRouteDestination{
-									{
-										Weight:      100 - canaryWeight,
-										Destination: &networking.Destination{Host: svc.Name},
-									},
-									{
-										Weight:      canaryWeight,
-										Destination: &networking.Destination{Host: canarySvc.Name},
-									},
-								},
-							},
-						},
-					},
+					}
+				default:
+					return fmt.Errorf("unsupported deployment strategy type: %s", ds.deployStrategy)
 				}
-				err = applyIstioVirtualService(ic, vs, l)
+
+				err = applyIstioVirtualService(ic, vs, ds.dryRun, l)
 				if err != nil {
 					return err
 				}
-				sleepSeconds(time.Second * time.Duration(intervalSeconds))
+				vsCreated = true
+				sleepSeconds(time.Second * time.Duration(ds.intervalSeconds))
 			}
-			canaryVsList.Items = append(canaryVsList.Items, vs)
-			l.LogAndPrintf("Start baking canary deployment: %s", canaryDeploy.Name)
-			sleepSeconds(time.Second * time.Duration(bakingSeconds))
+			if vsCreated {
+				newVsList.Items = append(newVsList.Items, vs)
+				l.LogAndPrintf("Start baking %s deployment: %s", ds.deployStrategy, newDeploy.Name)
+				sleepSeconds(time.Second * time.Duration(ds.bakingSeconds))
+			}
 		}
 	}
+	if err = cleanup(ic, clientObj, ds.dryRun, l); err != nil {
+		return err
+	}
+	return nil
+}
 
-	l.LogAndPrint("Start cleaning up canary virtual services")
-	for _, cvs := range canaryVsList.Items {
-		if err := deleteIstioVirtualService(ic, cvs, l); err != nil {
+func isValidFile(f string) bool {
+	ext := filepath.Ext(f)
+	for _, e := range fileExtensions {
+		if e == ext {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanup(ic *istioc.Clientset, clientObj client.Client, dryRun bool, l clog.Logger) error {
+	l.LogAndPrint("\nStart cleaning up virtual services")
+	for _, cvs := range newVsList.Items {
+		if err := deleteIstioVirtualService(ic, cvs, dryRun, l); err != nil {
 			return err
 		}
 	}
 
-	l.LogAndPrint("Start cleaning up other canary resources")
-	for _, cs := range canaryObjList.Items {
-		if err := deleteObj(cs, clientObj, l); err != nil {
+	l.LogAndPrint("Start cleaning up other resources")
+	for _, cs := range newObjList.Items {
+		if err := deleteObj(cs, clientObj, dryRun, l); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, l clog.Logger) error {
+func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun bool, l clog.Logger) error {
+	var dryRunOpt []string
+	dryRunMessage := ""
+	if dryRun {
+		dryRunMessage = dryRunStr
+		dryRunOpt = []string{metav1.DryRunAll}
+	}
 	objectStr := fmt.Sprintf("VirtualService/%s", vs.Name)
 	existingObj, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Get(context.TODO(), vs.Name, metav1.GetOptions{})
 	switch {
 	case errors.IsNotFound(err):
-		_, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Create(context.TODO(), &vs, metav1.CreateOptions{})
+		_, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Create(context.TODO(), &vs, metav1.CreateOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s create error", objectStr)
+			l.LogAndPrintf("%s create error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to create %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s created", objectStr)
+		l.LogAndPrintf("%s created%s", objectStr, dryRunMessage)
 	case err == nil:
 		vs.ResourceVersion = existingObj.GetResourceVersion()
-		newObj, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Update(context.TODO(), &vs, metav1.UpdateOptions{})
+		newObj, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Update(context.TODO(), &vs, metav1.UpdateOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s update error", objectStr)
+			l.LogAndPrintf("%s update error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to update %q: %w", objectStr, err)
 		}
 		if eq, err := compareObjects(newObj, existingObj); err != nil {
 			return err
 		} else if eq {
-			l.LogAndPrintf("%s unchanged", objectStr)
+			l.LogAndPrintf("%s unchanged%s", objectStr, dryRunMessage)
 		} else {
-			l.LogAndPrintf("%s configured", objectStr)
+			l.LogAndPrintf("%s configured%s", objectStr, dryRunMessage)
 		}
 	default:
 		return err
@@ -332,19 +456,25 @@ func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, l
 	return nil
 }
 
-func deleteIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, l clog.Logger) error {
+func deleteIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun bool, l clog.Logger) error {
+	var dryRunOpt []string
+	dryRunMessage := ""
+	if dryRun {
+		dryRunMessage = dryRunStr
+		dryRunOpt = []string{metav1.DryRunAll}
+	}
 	objectStr := fmt.Sprintf("VirtualService/%s", vs.Name)
 	_, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Get(context.TODO(), vs.Name, metav1.GetOptions{})
 	switch {
 	case errors.IsNotFound(err):
-		l.LogAndPrintf("%s not found", objectStr)
+		l.LogAndPrintf("%s not found%s", objectStr, dryRunMessage)
 	case err == nil:
-		err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Delete(context.TODO(), vs.GetName(), metav1.DeleteOptions{})
+		err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Delete(context.TODO(), vs.GetName(), metav1.DeleteOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s delete error", objectStr)
+			l.LogAndPrintf("%s delete error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to delete %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s deleted", objectStr)
+		l.LogAndPrintf("%s deleted%s", objectStr, dryRunMessage)
 	default:
 		return err
 	}
@@ -364,7 +494,14 @@ func containsAll(am, bm map[string]string) bool {
 	return true
 }
 
-func deleteObj(obj unstructured.Unstructured, clientObj client.Client, l clog.Logger) error {
+func deleteObj(obj unstructured.Unstructured, clientObj client.Client, dryRun bool, l clog.Logger) error {
+	var dryRunOpt client.DeleteOptions
+	dryRunMessage := ""
+	if dryRun {
+		dryRunMessage = dryRunStr
+		dryRunOpt = client.DeleteOptions{DryRun: []string{metav1.DryRunAll}}
+	}
+
 	objectStr := fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName())
 	existingObj := &unstructured.Unstructured{}
 	existingObj.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
@@ -372,21 +509,29 @@ func deleteObj(obj unstructured.Unstructured, clientObj client.Client, l clog.Lo
 	err := clientObj.Get(context.TODO(), objectKey, existingObj)
 	switch {
 	case errors.IsNotFound(err):
-		l.LogAndPrintf("%s not found", objectStr)
+		l.LogAndPrintf("%s not found%s", objectStr, dryRunMessage)
 	case err == nil:
-		err := clientObj.Delete(context.TODO(), existingObj)
+		err := clientObj.Delete(context.TODO(), existingObj, &dryRunOpt)
 		if err != nil {
-			l.LogAndPrintf("%s delete error", objectStr)
+			l.LogAndPrintf("%s delete error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to delete %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s deleted", objectStr)
+		l.LogAndPrintf("%s deleted%s", objectStr, dryRunMessage)
 	default:
 		return err
 	}
 	return nil
 }
 
-func applyObj(obj unstructured.Unstructured, clientObj client.Client, l clog.Logger) error {
+func applyObj(obj unstructured.Unstructured, clientObj client.Client, dryRun bool, l clog.Logger) error {
+	var dryRunOptC client.CreateOptions
+	var dryRunOptU client.UpdateOptions
+	dryRunMessage := ""
+	if dryRun {
+		dryRunMessage = dryRunStr
+		dryRunOptC = client.CreateOptions{DryRun: []string{metav1.DryRunAll}}
+		dryRunOptU = client.UpdateOptions{DryRun: []string{metav1.DryRunAll}}
+	}
 	objectStr := fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName())
 	existingObj := &unstructured.Unstructured{}
 	existingObj.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
@@ -394,29 +539,29 @@ func applyObj(obj unstructured.Unstructured, clientObj client.Client, l clog.Log
 	err := clientObj.Get(context.TODO(), objectKey, existingObj)
 	switch {
 	case errors.IsNotFound(err):
-		err = clientObj.Create(context.TODO(), &obj)
+		err = clientObj.Create(context.TODO(), &obj, &dryRunOptC)
 		if err != nil {
-			l.LogAndPrintf("%s create error", objectStr)
+			l.LogAndPrintf("%s create error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to create %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s created", objectStr)
+		l.LogAndPrintf("%s created%s", objectStr, dryRunMessage)
 	case err == nil:
 		// TODO: repleace with k8s service-side apply
 		newObj := existingObj.DeepCopy()
 		if err := applyPatch(newObj, &obj); err != nil {
 			return err
 		}
-		err := clientObj.Update(context.TODO(), newObj)
+		err := clientObj.Update(context.TODO(), newObj, &dryRunOptU)
 		if err != nil {
-			l.LogAndPrintf("%s update error", objectStr)
+			l.LogAndPrintf("%s update error%s", objectStr, dryRunMessage)
 			return fmt.Errorf("failed to update %q: %w", objectStr, err)
 		}
 		if eq, err := compareObjects(newObj, existingObj); err != nil {
 			return err
 		} else if eq {
-			l.LogAndPrintf("%s unchanged", objectStr)
+			l.LogAndPrintf("%s unchanged%s", objectStr, dryRunMessage)
 		} else {
-			l.LogAndPrintf("%s configured", objectStr)
+			l.LogAndPrintf("%s configured%s", objectStr, dryRunMessage)
 		}
 	default:
 		return err
@@ -473,9 +618,6 @@ func readYAMLs(filenames []string, stdinReader io.Reader) (string, error) {
 			return "", err
 		}
 		ym += string(b) + helm.YAMLSeparator
-		if err != nil {
-			return "", err
-		}
 	}
 	return ym, nil
 }
