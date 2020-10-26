@@ -76,6 +76,14 @@ const (
 	Shadow                    = "shadow"
 )
 
+type CleanupType string
+
+const (
+	CleanupYes  CleanupType = "yes"
+	CleanupNo               = "no"
+	CleanupOnly             = "only"
+)
+
 var (
 	newObjList     unstructured.UnstructuredList
 	newVsList      istiocn.VirtualServiceList
@@ -89,7 +97,7 @@ type deploymentStrategy struct {
 	intervalSeconds int
 	bakingSeconds   int
 	deployStrategy  DeployStrategyType
-	dryRun          bool
+	cleanup         CleanupType
 }
 
 func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
@@ -100,9 +108,10 @@ func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
 	cmd.PersistentFlags().BoolVarP(&args.skipConfirmation, "skip-confirmation", "y", false, skipConfirmationFlagHelpStr)
 	cmd.PersistentFlags().Int32Var(&args.strategy.endWeight, "end-weight", 30, "")
 	cmd.PersistentFlags().Int32Var(&args.strategy.stepWeight, "step-weight", 6, "")
-	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 5, "")
-	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 600, "")
-	cmd.PersistentFlags().StringVar((*string)(&args.strategy.deployStrategy), "deploy-strategy", Shadow, ContextFlagHelpStr)
+	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 1, "")
+	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 1, "")
+	cmd.PersistentFlags().StringVar((*string)(&args.strategy.deployStrategy), "deploy-strategy", Shadow, "The strategy to apply deployments")
+	cmd.PersistentFlags().StringVar((*string)(&args.strategy.cleanup), "cleanup", string(CleanupYes), "The way to clean up resources created by this command")
 }
 
 // StrategicApplyCmd generates shadow/canary deployments and applies it to a cluster
@@ -140,15 +149,8 @@ func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyAr
 		// TODO: use the local kubeconfig's current namespace
 		iArgs.namespace = "default"
 	}
-	ds := &deploymentStrategy{
-		endWeight:       iArgs.strategy.endWeight,
-		stepWeight:      iArgs.strategy.stepWeight,
-		intervalSeconds: iArgs.strategy.intervalSeconds,
-		bakingSeconds:   iArgs.strategy.bakingSeconds,
-		deployStrategy:  iArgs.strategy.deployStrategy,
-		dryRun:          rootArgs.dryRun,
-	}
-	if err := StrategicApplyManifests(ds, iArgs.inFilenames, iArgs.namespace, iArgs.kubeConfigPath, iArgs.context, l); err != nil {
+	if err := StrategicApplyManifests(&iArgs.strategy, iArgs.inFilenames, iArgs.namespace,
+		rootArgs.dryRun, iArgs.kubeConfigPath, iArgs.context, l); err != nil {
 		return fmt.Errorf("failed to strategic-apply manifests: %v", err)
 	}
 
@@ -158,7 +160,8 @@ func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyAr
 // StrategicApplyManifests generates manifests from the given input files and --set flag
 // overlays and applies them to the cluster
 //  dryRun  all operations are done but nothing is written
-func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, namespace, kubeConfigPath string, ctx string, l clog.Logger) error {
+func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, namespace string,
+	dryRun bool, kubeConfigPath, ctx string, l clog.Logger) error {
 	restConfig, _, clientObj, err := K8sConfig(kubeConfigPath, ctx)
 	ic, err := istioc.NewForConfig(restConfig)
 	if err != nil {
@@ -168,13 +171,16 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 	// Register cleanup process for interrupt and terminate signals
 	signals := make(chan os.Signal)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-signals
-		if err := cleanup(ic, clientObj, ds.dryRun, l); err != nil {
-			l.LogAndPrint("Clean up failed: %s", err)
-		}
-		os.Exit(1)
-	}()
+
+	if ds.cleanup == CleanupYes {
+		go func() {
+			<-signals
+			if err := cleanup(ic, clientObj, dryRun, l); err != nil {
+				l.LogAndPrint("Clean up failed: %s", err)
+			}
+			os.Exit(1)
+		}()
+	}
 
 	var filenames []string
 	for _, path := range inFilenames {
@@ -226,15 +232,17 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 	deployObjs := object.KindObjects(allObjects, name.DeploymentStr)
 	nonDeployObjs := object.ObjectsNotInLists(allObjects, deployObjs)
 
-	l.LogAndPrint("\nApply non-deployment objects:")
-	for _, obj := range nonDeployObjs.UnstructuredItems() {
-		obj.SetNamespace(namespace)
-		if err := applyObj(obj, clientObj, ds.dryRun, l); err != nil {
-			return err
+	if ds.cleanup != CleanupOnly {
+		l.LogAndPrint("\nApply non-deployment objects:")
+		for _, obj := range nonDeployObjs.UnstructuredItems() {
+			obj.SetNamespace(namespace)
+			if err := applyObj(obj, clientObj, dryRun, l); err != nil {
+				return err
+			}
 		}
+		l.LogAndPrintf("\nApply deployments with %s:", ds.deployStrategy)
 	}
 
-	l.LogAndPrintf("\nApply deployments with %s:", ds.deployStrategy)
 	for _, deploy := range deployObjs.UnstructuredItems() {
 		newDeploy := &appsv1.Deployment{}
 		if err = runtime.DefaultUnstructuredConverter.FromUnstructured(deploy.Object, &newDeploy); err != nil {
@@ -258,8 +266,10 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 
 		newObj := unstructured.Unstructured{Object: newDeployUnstructed}
 		newObjList.Items = append(newObjList.Items, newObj)
-		if err := applyObj(newObj, clientObj, ds.dryRun, l); err != nil {
-			return err
+		if ds.cleanup != CleanupOnly {
+			if err := applyObj(newObj, clientObj, dryRun, l); err != nil {
+				return err
+			}
 		}
 
 		// Find all services
@@ -298,96 +308,115 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 			}
 			newObj := unstructured.Unstructured{Object: newSvcUnstructed}
 			newObjList.Items = append(newObjList.Items, newObj)
-			if err := applyObj(newObj, clientObj, ds.dryRun, l); err != nil {
-				return err
+			if ds.cleanup != CleanupOnly {
+				if err := applyObj(newObj, clientObj, dryRun, l); err != nil {
+					return err
+				}
 			}
 
-			l.LogAndPrintf("Start shifting/mirroring traffic to %s", newSvc.GetName())
-			var vs istiocn.VirtualService
-			vsCreated := false
-			for currentWeight := int32(0); currentWeight <= ds.endWeight; currentWeight += ds.stepWeight {
-				l.LogAndPrintf("Shift traffic weight to %v", currentWeight)
+			if ds.cleanup == CleanupOnly {
 				switch {
-				case ds.deployStrategy == Shadow:
-					vs = istiocn.VirtualService{
+				case ds.deployStrategy == Shadow || ds.deployStrategy == Canary:
+					vs := istiocn.VirtualService{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      svc.Name + "-" + string(ds.deployStrategy),
 							Namespace: svc.Namespace,
 						},
-						Spec: networking.VirtualService{
-							Hosts: []string{svc.Name},
-							Http: []*networking.HTTPRoute{
-								{
-									Route: []*networking.HTTPRouteDestination{
-										{
-											Weight:      100,
-											Destination: &networking.Destination{Host: svc.Name},
-										},
-									},
-									Mirror: &networking.Destination{Host: newSvc.Name},
-									MirrorPercentage: &networking.Percent{Value: float64(currentWeight)},
-								},
-							},
-						},
 					}
-				case ds.deployStrategy == Canary:
-					vs = istiocn.VirtualService{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      svc.Name + "-" + string(ds.deployStrategy),
-							Namespace: svc.Namespace,
-						},
-						Spec: networking.VirtualService{
-							Hosts: []string{svc.Name},
-							Tcp: []*networking.TCPRoute{
-								{
-									Route: []*networking.RouteDestination{
-										{
-											Weight:      100 - currentWeight,
-											Destination: &networking.Destination{Host: svc.Name},
-										},
-										{
-											Weight:      currentWeight,
-											Destination: &networking.Destination{Host: newSvc.Name},
-										},
-									},
-								},
-							},
-							Http: []*networking.HTTPRoute{
-								{
-									Route: []*networking.HTTPRouteDestination{
-										{
-											Weight:      100 - currentWeight,
-											Destination: &networking.Destination{Host: svc.Name},
-										},
-										{
-											Weight:      currentWeight,
-											Destination: &networking.Destination{Host: newSvc.Name},
-										},
-									},
-								},
-							},
-						},
-					}
+					newVsList.Items = append(newVsList.Items, vs)
 				default:
 					return fmt.Errorf("unsupported deployment strategy type: %s", ds.deployStrategy)
 				}
+			} else { // Not cleanup only, apply the virtual service to shift/mirror traffic
+				l.LogAndPrintf("Start shifting/mirroring traffic to %s", newSvc.GetName())
+				var vs istiocn.VirtualService
+				vsCreated := false
+				for currentWeight := int32(0); currentWeight <= ds.endWeight; currentWeight += ds.stepWeight {
+					l.LogAndPrintf("Shift traffic weight to %v", currentWeight)
+					switch {
+					case ds.deployStrategy == Shadow:
+						vs = istiocn.VirtualService{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      svc.Name + "-" + string(ds.deployStrategy),
+								Namespace: svc.Namespace,
+							},
+							Spec: networking.VirtualService{
+								Hosts: []string{svc.Name},
+								Http: []*networking.HTTPRoute{
+									{
+										Route: []*networking.HTTPRouteDestination{
+											{
+												Weight:      100,
+												Destination: &networking.Destination{Host: svc.Name},
+											},
+										},
+										Mirror:           &networking.Destination{Host: newSvc.Name},
+										MirrorPercentage: &networking.Percent{Value: float64(currentWeight)},
+									},
+								},
+							},
+						}
+					case ds.deployStrategy == Canary:
+						vs = istiocn.VirtualService{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      svc.Name + "-" + string(ds.deployStrategy),
+								Namespace: svc.Namespace,
+							},
+							Spec: networking.VirtualService{
+								Hosts: []string{svc.Name},
+								Tcp: []*networking.TCPRoute{
+									{
+										Route: []*networking.RouteDestination{
+											{
+												Weight:      100 - currentWeight,
+												Destination: &networking.Destination{Host: svc.Name},
+											},
+											{
+												Weight:      currentWeight,
+												Destination: &networking.Destination{Host: newSvc.Name},
+											},
+										},
+									},
+								},
+								Http: []*networking.HTTPRoute{
+									{
+										Route: []*networking.HTTPRouteDestination{
+											{
+												Weight:      100 - currentWeight,
+												Destination: &networking.Destination{Host: svc.Name},
+											},
+											{
+												Weight:      currentWeight,
+												Destination: &networking.Destination{Host: newSvc.Name},
+											},
+										},
+									},
+								},
+							},
+						}
+					default:
+						return fmt.Errorf("unsupported deployment strategy type: %s", ds.deployStrategy)
+					}
 
-				err = applyIstioVirtualService(ic, vs, ds.dryRun, l)
-				if err != nil {
-					return err
+					err = applyIstioVirtualService(ic, vs, dryRun, l)
+					if err != nil {
+						return err
+					}
+					vsCreated = true
+					sleepSeconds(time.Second * time.Duration(ds.intervalSeconds))
 				}
-				vsCreated = true
-				sleepSeconds(time.Second * time.Duration(ds.intervalSeconds))
-			}
-			if vsCreated {
-				newVsList.Items = append(newVsList.Items, vs)
-				l.LogAndPrintf("Start baking %s deployment: %s", ds.deployStrategy, newDeploy.Name)
-				sleepSeconds(time.Second * time.Duration(ds.bakingSeconds))
+				if vsCreated {
+					newVsList.Items = append(newVsList.Items, vs)
+					l.LogAndPrintf("Start baking %s deployment: %s", ds.deployStrategy, newDeploy.Name)
+					sleepSeconds(time.Second * time.Duration(ds.bakingSeconds))
+				}
 			}
 		}
 	}
-	if err = cleanup(ic, clientObj, ds.dryRun, l); err != nil {
-		return err
+	if ds.cleanup == CleanupYes || ds.cleanup == CleanupOnly {
+		if err = cleanup(ic, clientObj, dryRun, l); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -410,7 +439,7 @@ func cleanup(ic *istioc.Clientset, clientObj client.Client, dryRun bool, l clog.
 		}
 	}
 
-	l.LogAndPrint("Start cleaning up other resources")
+	l.LogAndPrint("\nStart cleaning up other resources")
 	for _, cs := range newObjList.Items {
 		if err := deleteObj(cs, clientObj, dryRun, l); err != nil {
 			return err
