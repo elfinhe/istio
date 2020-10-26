@@ -108,8 +108,8 @@ func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
 	cmd.PersistentFlags().BoolVarP(&args.skipConfirmation, "skip-confirmation", "y", false, skipConfirmationFlagHelpStr)
 	cmd.PersistentFlags().Int32Var(&args.strategy.endWeight, "end-weight", 30, "")
 	cmd.PersistentFlags().Int32Var(&args.strategy.stepWeight, "step-weight", 6, "")
-	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 1, "")
-	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 1, "")
+	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 5, "")
+	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 60, "")
 	cmd.PersistentFlags().StringVar((*string)(&args.strategy.deployStrategy), "deploy-strategy", Shadow, "The strategy to apply deployments")
 	cmd.PersistentFlags().StringVar((*string)(&args.strategy.cleanup), "cleanup", string(CleanupYes), "The way to clean up resources created by this command")
 }
