@@ -214,7 +214,7 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 		}
 	}
 
-	ym, err := readYAMLs(inFilenames, os.Stdin)
+	ym, err := readYAMLs(filenames, os.Stdin)
 	if err != nil {
 		return err
 	}
