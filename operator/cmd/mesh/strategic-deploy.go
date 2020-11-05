@@ -67,6 +67,8 @@ type applyArgs struct {
 	skipConfirmation bool
 	// force proceeds even if there are validation errors
 	force bool
+	// suppress the prompt messages
+	silent bool
 }
 
 type DeployStrategyType string
@@ -79,8 +81,8 @@ const (
 type CleanupType string
 
 const (
-	CleanupYes  CleanupType = "yes"
-	CleanupNo               = "no"
+	CleanupNo   CleanupType = "no"
+	CleanupYes              = "yes"
 	CleanupOnly             = "only"
 )
 
@@ -98,6 +100,8 @@ type deploymentStrategy struct {
 	bakingSeconds   int
 	deployStrategy  DeployStrategyType
 	cleanup         CleanupType
+	dump            bool
+	dumpWeight      int32
 }
 
 func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
@@ -111,7 +115,10 @@ func addApplyFlags(cmd *cobra.Command, args *applyArgs) {
 	cmd.PersistentFlags().IntVar(&args.strategy.intervalSeconds, "interval-seconds", 5, "")
 	cmd.PersistentFlags().IntVar(&args.strategy.bakingSeconds, "baking-seconds", 60, "")
 	cmd.PersistentFlags().StringVar((*string)(&args.strategy.deployStrategy), "deploy-strategy", Shadow, "The strategy to apply deployments")
-	cmd.PersistentFlags().StringVar((*string)(&args.strategy.cleanup), "cleanup", string(CleanupYes), "The way to clean up resources created by this command")
+	cmd.PersistentFlags().StringVar((*string)(&args.strategy.cleanup), "cleanup", CleanupYes, "The way to clean up resources created by this command")
+	cmd.PersistentFlags().BoolVar(&args.strategy.dump, "dump", true, "Dump the manifests for deployment strategies")
+	cmd.PersistentFlags().Int32Var(&args.strategy.dumpWeight, "weight", 10, "")
+	cmd.PersistentFlags().BoolVar(&args.silent, "silent", false, "Suppress the prompt messages")
 }
 
 // StrategicApplyCmd generates shadow/canary deployments and applies it to a cluster
@@ -120,8 +127,8 @@ func StrategicApplyCmd(logOpts *log.Options) *cobra.Command {
 	iArgs := &applyArgs{}
 
 	ic := &cobra.Command{
-		Use:   "strategic-apply",
-		Short: "Apply shadow/canary analysis for deployments, and cleanup resources after the analysis",
+		Use:   "strategic-deploy",
+		Short: "Shadow/canary analysis for deployments",
 		Args:  cobra.ExactArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStrategicApplyCmd(cmd, rootArgs, iArgs, logOpts)
@@ -136,7 +143,7 @@ func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyAr
 	l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
 	// Warn users if no arg
 	if !rootArgs.dryRun && !iArgs.skipConfirmation {
-		if !confirm("This will strategic-apply manifests into the cluster. Proceed? (y/N)", cmd.OutOrStdout()) {
+		if !confirm("This will strategic-deploy manifests into the cluster. Proceed? (y/N)", cmd.OutOrStdout()) {
 			cmd.Print("Cancelled.\n")
 			os.Exit(1)
 		}
@@ -149,9 +156,20 @@ func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyAr
 		// TODO: use the local kubeconfig's current namespace
 		iArgs.namespace = "default"
 	}
+
+	// Set dump
+	if iArgs.strategy.dump {
+		iArgs.strategy.stepWeight = iArgs.strategy.dumpWeight
+		iArgs.strategy.endWeight = iArgs.strategy.dumpWeight
+		iArgs.strategy.bakingSeconds = 0
+		iArgs.strategy.intervalSeconds = 0
+		rootArgs.dryRun = true
+		iArgs.silent = true
+	}
+
 	if err := StrategicApplyManifests(&iArgs.strategy, iArgs.inFilenames, iArgs.namespace,
-		rootArgs.dryRun, iArgs.kubeConfigPath, iArgs.context, l); err != nil {
-		return fmt.Errorf("failed to strategic-apply manifests: %v", err)
+		rootArgs.dryRun, iArgs.silent, iArgs.kubeConfigPath, iArgs.context, l); err != nil {
+		return fmt.Errorf("failed to strategic-deploy manifests: %v", err)
 	}
 
 	return nil
@@ -161,7 +179,7 @@ func runStrategicApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *applyAr
 // overlays and applies them to the cluster
 //  dryRun  all operations are done but nothing is written
 func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, namespace string,
-	dryRun bool, kubeConfigPath, ctx string, l clog.Logger) error {
+	dryRun, silent bool, kubeConfigPath, ctx string, l clog.Logger) error {
 	restConfig, _, clientObj, err := K8sConfig(kubeConfigPath, ctx)
 	ic, err := istioc.NewForConfig(restConfig)
 	if err != nil {
@@ -175,8 +193,10 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 	if ds.cleanup == CleanupYes {
 		go func() {
 			<-signals
-			if err := cleanup(ic, clientObj, dryRun, l); err != nil {
-				l.LogAndPrint("Clean up failed: %s", err)
+			if err := cleanup(ic, clientObj, dryRun, silent, l); err != nil {
+				if !silent {
+					l.LogAndError("Clean up failed: %s", err)
+				}
 			}
 			os.Exit(1)
 		}()
@@ -200,7 +220,9 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 					return nil
 				}
 				if !isValidFile(path) {
-					l.LogAndPrintf("Skipping file %v, recognized file extensions are: %v\n", path, fileExtensions)
+					if !silent {
+						l.LogAndErrorf("Skipping file %v, recognized file extensions are: %v\n", path, fileExtensions)
+					}
 					return nil
 				}
 				filenames = append(filenames, path)
@@ -224,23 +246,31 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 		return err
 	}
 
-	l.LogAndPrint("\nObjects from manifests:")
+	if !silent {
+		l.LogAndError("\nObjects from manifests:")
+	}
 	for _, obj := range allObjects.UnstructuredItems() {
-		l.LogAndPrintf(fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+		if !silent {
+			l.LogAndErrorf(fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+		}
 	}
 
 	deployObjs := object.KindObjects(allObjects, name.DeploymentStr)
 	nonDeployObjs := object.ObjectsNotInLists(allObjects, deployObjs)
 
 	if ds.cleanup != CleanupOnly {
-		l.LogAndPrint("\nApply non-deployment objects:")
+		if !silent {
+			l.LogAndError("\nApply non-deployment objects:")
+		}
 		for _, obj := range nonDeployObjs.UnstructuredItems() {
 			obj.SetNamespace(namespace)
-			if err := applyObj(obj, clientObj, dryRun, l); err != nil {
+			if err := applyObj(obj, clientObj, dryRun, silent, l); err != nil {
 				return err
 			}
 		}
-		l.LogAndPrintf("\nApply deployments with %s:", ds.deployStrategy)
+		if !silent {
+			l.LogAndErrorf("\nApply deployments with %s:", ds.deployStrategy)
+		}
 	}
 
 	for _, deploy := range deployObjs.UnstructuredItems() {
@@ -267,7 +297,7 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 		newObj := unstructured.Unstructured{Object: newDeployUnstructed}
 		newObjList.Items = append(newObjList.Items, newObj)
 		if ds.cleanup != CleanupOnly {
-			if err := applyObj(newObj, clientObj, dryRun, l); err != nil {
+			if err := applyObj(newObj, clientObj, dryRun, silent, l); err != nil {
 				return err
 			}
 		}
@@ -309,7 +339,7 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 			newObj := unstructured.Unstructured{Object: newSvcUnstructed}
 			newObjList.Items = append(newObjList.Items, newObj)
 			if ds.cleanup != CleanupOnly {
-				if err := applyObj(newObj, clientObj, dryRun, l); err != nil {
+				if err := applyObj(newObj, clientObj, dryRun, silent, l); err != nil {
 					return err
 				}
 			}
@@ -318,6 +348,10 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 				switch {
 				case ds.deployStrategy == Shadow || ds.deployStrategy == Canary:
 					vs := istiocn.VirtualService{
+						TypeMeta: metav1.TypeMeta{
+							Kind:       "VirtualService",
+							APIVersion: "networking.istio.io/v1beta1",
+						},
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      svc.Name + "-" + string(ds.deployStrategy),
 							Namespace: svc.Namespace,
@@ -328,14 +362,22 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 					return fmt.Errorf("unsupported deployment strategy type: %s", ds.deployStrategy)
 				}
 			} else { // Not cleanup only, apply the virtual service to shift/mirror traffic
-				l.LogAndPrintf("Start shifting/mirroring traffic to %s", newSvc.GetName())
+				if !silent {
+					l.LogAndErrorf("Start shifting/mirroring traffic to %s", newSvc.GetName())
+				}
 				var vs istiocn.VirtualService
 				vsCreated := false
 				for currentWeight := int32(0); currentWeight <= ds.endWeight; currentWeight += ds.stepWeight {
-					l.LogAndPrintf("Shift traffic weight to %v", currentWeight)
+					if !silent {
+						l.LogAndErrorf("Shift traffic weight to %v", currentWeight)
+					}
 					switch {
 					case ds.deployStrategy == Shadow:
 						vs = istiocn.VirtualService{
+							TypeMeta: metav1.TypeMeta{
+								Kind:       "VirtualService",
+								APIVersion: "networking.istio.io/v1beta1",
+							},
 							ObjectMeta: metav1.ObjectMeta{
 								Name:      svc.Name + "-" + string(ds.deployStrategy),
 								Namespace: svc.Namespace,
@@ -358,6 +400,10 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 						}
 					case ds.deployStrategy == Canary:
 						vs = istiocn.VirtualService{
+							TypeMeta: metav1.TypeMeta{
+								Kind:       "VirtualService",
+								APIVersion: "networking.istio.io/v1beta1",
+							},
 							ObjectMeta: metav1.ObjectMeta{
 								Name:      svc.Name + "-" + string(ds.deployStrategy),
 								Namespace: svc.Namespace,
@@ -398,23 +444,63 @@ func StrategicApplyManifests(ds *deploymentStrategy, inFilenames []string, names
 						return fmt.Errorf("unsupported deployment strategy type: %s", ds.deployStrategy)
 					}
 
-					err = applyIstioVirtualService(ic, vs, dryRun, l)
+					err = applyIstioVirtualService(ic, vs, dryRun, silent, l)
 					if err != nil {
 						return err
 					}
 					vsCreated = true
-					sleepSeconds(time.Second * time.Duration(ds.intervalSeconds))
+					if !(ds.dump || dryRun) {
+						sleepSeconds(time.Second * time.Duration(ds.intervalSeconds))
+					}
 				}
 				if vsCreated {
 					newVsList.Items = append(newVsList.Items, vs)
-					l.LogAndPrintf("Start baking %s deployment: %s", ds.deployStrategy, newDeploy.Name)
-					sleepSeconds(time.Second * time.Duration(ds.bakingSeconds))
+					if !silent {
+						l.LogAndErrorf("Start baking %s deployment: %s", ds.deployStrategy, newDeploy.Name)
+					}
+					if !(ds.dump || dryRun) {
+						sleepSeconds(time.Second * time.Duration(ds.bakingSeconds))
+					}
 				}
 			}
 		}
 	}
-	if ds.cleanup == CleanupYes || ds.cleanup == CleanupOnly {
-		if err = cleanup(ic, clientObj, dryRun, l); err != nil {
+
+	if ds.dump {
+		var output string
+		if ds.cleanup != CleanupOnly {
+			for _, o := range nonDeployObjs {
+				y, err := o.YAML()
+				if err != nil {
+					return err
+				}
+				output += string(y) + helm.YAMLSeparator
+			}
+		}
+		for _, obj := range newObjList.Items {
+			o := object.NewK8sObject(&obj, nil, nil)
+			y, err := o.YAML()
+			if err != nil {
+				return err
+			}
+			output += string(y) + helm.YAMLSeparator
+		}
+		for _, vs := range newVsList.Items {
+			m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vs.DeepCopyObject())
+			if err != nil {
+				return err
+			}
+			u := &unstructured.Unstructured{Object: m}
+			o := object.NewK8sObject(u, nil, nil)
+			y, err := o.YAML()
+			if err != nil {
+				return err
+			}
+			output += string(y) + helm.YAMLSeparator
+		}
+		l.LogAndPrint(output)
+	} else if ds.cleanup == CleanupYes || ds.cleanup == CleanupOnly {
+		if err = cleanup(ic, clientObj, dryRun, silent, l); err != nil {
 			return err
 		}
 	}
@@ -431,24 +517,28 @@ func isValidFile(f string) bool {
 	return false
 }
 
-func cleanup(ic *istioc.Clientset, clientObj client.Client, dryRun bool, l clog.Logger) error {
-	l.LogAndPrint("\nStart cleaning up virtual services")
+func cleanup(ic *istioc.Clientset, clientObj client.Client, dryRun, silent bool, l clog.Logger) error {
+	if !silent {
+		l.LogAndError("\nStart cleaning up virtual services")
+	}
 	for _, cvs := range newVsList.Items {
-		if err := deleteIstioVirtualService(ic, cvs, dryRun, l); err != nil {
+		if err := deleteIstioVirtualService(ic, cvs, dryRun, silent, l); err != nil {
 			return err
 		}
 	}
 
-	l.LogAndPrint("\nStart cleaning up other resources")
+	if !silent {
+		l.LogAndError("\nStart cleaning up other resources")
+	}
 	for _, cs := range newObjList.Items {
-		if err := deleteObj(cs, clientObj, dryRun, l); err != nil {
+		if err := deleteObj(cs, clientObj, dryRun, silent, l); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun bool, l clog.Logger) error {
+func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun, silent bool, l clog.Logger) error {
 	var dryRunOpt []string
 	dryRunMessage := ""
 	if dryRun {
@@ -461,23 +551,33 @@ func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, d
 	case errors.IsNotFound(err):
 		_, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Create(context.TODO(), &vs, metav1.CreateOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s create error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s create error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to create %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s created%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s created%s", objectStr, dryRunMessage)
+		}
 	case err == nil:
 		vs.ResourceVersion = existingObj.GetResourceVersion()
 		newObj, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Update(context.TODO(), &vs, metav1.UpdateOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s update error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s update error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to update %q: %w", objectStr, err)
 		}
 		if eq, err := compareObjects(newObj, existingObj); err != nil {
 			return err
 		} else if eq {
-			l.LogAndPrintf("%s unchanged%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s unchanged%s", objectStr, dryRunMessage)
+			}
 		} else {
-			l.LogAndPrintf("%s configured%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s configured%s", objectStr, dryRunMessage)
+			}
 		}
 	default:
 		return err
@@ -485,7 +585,7 @@ func applyIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, d
 	return nil
 }
 
-func deleteIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun bool, l clog.Logger) error {
+func deleteIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, dryRun, silent bool, l clog.Logger) error {
 	var dryRunOpt []string
 	dryRunMessage := ""
 	if dryRun {
@@ -496,14 +596,20 @@ func deleteIstioVirtualService(ic *istioc.Clientset, vs istiocn.VirtualService, 
 	_, err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Get(context.TODO(), vs.Name, metav1.GetOptions{})
 	switch {
 	case errors.IsNotFound(err):
-		l.LogAndPrintf("%s not found%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s not found%s", objectStr, dryRunMessage)
+		}
 	case err == nil:
 		err := ic.NetworkingV1beta1().VirtualServices(vs.Namespace).Delete(context.TODO(), vs.GetName(), metav1.DeleteOptions{DryRun: dryRunOpt})
 		if err != nil {
-			l.LogAndPrintf("%s delete error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s delete error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to delete %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s deleted%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s deleted%s", objectStr, dryRunMessage)
+		}
 	default:
 		return err
 	}
@@ -523,7 +629,7 @@ func containsAll(am, bm map[string]string) bool {
 	return true
 }
 
-func deleteObj(obj unstructured.Unstructured, clientObj client.Client, dryRun bool, l clog.Logger) error {
+func deleteObj(obj unstructured.Unstructured, clientObj client.Client, dryRun, silent bool, l clog.Logger) error {
 	var dryRunOpt client.DeleteOptions
 	dryRunMessage := ""
 	if dryRun {
@@ -538,21 +644,27 @@ func deleteObj(obj unstructured.Unstructured, clientObj client.Client, dryRun bo
 	err := clientObj.Get(context.TODO(), objectKey, existingObj)
 	switch {
 	case errors.IsNotFound(err):
-		l.LogAndPrintf("%s not found%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s not found%s", objectStr, dryRunMessage)
+		}
 	case err == nil:
 		err := clientObj.Delete(context.TODO(), existingObj, &dryRunOpt)
 		if err != nil {
-			l.LogAndPrintf("%s delete error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s delete error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to delete %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s deleted%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s deleted%s", objectStr, dryRunMessage)
+		}
 	default:
 		return err
 	}
 	return nil
 }
 
-func applyObj(obj unstructured.Unstructured, clientObj client.Client, dryRun bool, l clog.Logger) error {
+func applyObj(obj unstructured.Unstructured, clientObj client.Client, dryRun, silent bool, l clog.Logger) error {
 	var dryRunOptC client.CreateOptions
 	var dryRunOptU client.UpdateOptions
 	dryRunMessage := ""
@@ -570,10 +682,14 @@ func applyObj(obj unstructured.Unstructured, clientObj client.Client, dryRun boo
 	case errors.IsNotFound(err):
 		err = clientObj.Create(context.TODO(), &obj, &dryRunOptC)
 		if err != nil {
-			l.LogAndPrintf("%s create error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s create error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to create %q: %w", objectStr, err)
 		}
-		l.LogAndPrintf("%s created%s", objectStr, dryRunMessage)
+		if !silent {
+			l.LogAndErrorf("%s created%s", objectStr, dryRunMessage)
+		}
 	case err == nil:
 		// TODO: repleace with k8s service-side apply
 		newObj := existingObj.DeepCopy()
@@ -582,15 +698,21 @@ func applyObj(obj unstructured.Unstructured, clientObj client.Client, dryRun boo
 		}
 		err := clientObj.Update(context.TODO(), newObj, &dryRunOptU)
 		if err != nil {
-			l.LogAndPrintf("%s update error%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s update error%s", objectStr, dryRunMessage)
+			}
 			return fmt.Errorf("failed to update %q: %w", objectStr, err)
 		}
 		if eq, err := compareObjects(newObj, existingObj); err != nil {
 			return err
 		} else if eq {
-			l.LogAndPrintf("%s unchanged%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s unchanged%s", objectStr, dryRunMessage)
+			}
 		} else {
-			l.LogAndPrintf("%s configured%s", objectStr, dryRunMessage)
+			if !silent {
+				l.LogAndErrorf("%s configured%s", objectStr, dryRunMessage)
+			}
 		}
 	default:
 		return err
